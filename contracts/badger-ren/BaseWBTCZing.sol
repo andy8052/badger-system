@@ -56,7 +56,8 @@ interface ICurveExchange {
     ) external;
 }
 
-contract BadgerRenAdapter is OwnableUpgradeable {
+// BaseWBTCZing allows native BTC -> wBTC "zings" straight into a sett.
+contract BaseWBTCZing is OwnableUpgradeable {
     using SafeMathUpgradeable for uint256;
     using SafeERC20 for IERC20;
 
@@ -68,11 +69,9 @@ contract BadgerRenAdapter is OwnableUpgradeable {
     // Curve exchange contract for the renBTC/wBTC pool.
     ICurveExchange public exchange;
 
-    event RecoverStuckRenBTC(uint256 amount, uint256 fee);
-    event MintRenBTC(uint256 amount, uint256 fee);
-    event BurnRenBTC(uint256 amount, uint256 fee);
+    event RecoverStuck(uint256 amount);
     event MintWBTC(uint256 renbtc_minted, uint256 wbtc_exchanged, uint256 fee);
-    event BurnWBTC(uint256 wbtc_transferred, uint256 renbtc_burned, uint256 fee);
+    event MintRenBTC(uint256 amount, uint256 fee);
     event ExchangeWBTCBytesError(bytes error);
     event ExchangeWBTCStringError(string error);
 
@@ -80,20 +79,19 @@ contract BadgerRenAdapter is OwnableUpgradeable {
     address public governance;
 
     uint256 public mintFeeBps;
-    uint256 public burnFeeBps;
     uint256 private percentageFeeRewardsBps;
     uint256 private percentageFeeGovernanceBps;
 
     uint256 public constant MAX_BPS = 10000;
 
-    function initialize(
+    function __BaseWBTCZing_init(
         address _governance,
         address _rewards,
-        address _registry,
         address _exchange,
         address _wbtc,
-        uint256[4] memory _feeConfig
-    ) public {
+        address _registry,
+        uint256[3] memory _feeConfig
+    ) public initializer {
         governance = _governance;
         rewards = _rewards;
 
@@ -103,13 +101,8 @@ contract BadgerRenAdapter is OwnableUpgradeable {
         wBTC = IERC20(_wbtc);
 
         mintFeeBps = _feeConfig[0];
-        burnFeeBps = _feeConfig[1];
-        percentageFeeRewardsBps = _feeConfig[2];
-        percentageFeeGovernanceBps = _feeConfig[3];
-
-        // Approve exchange.
-        require(renBTC.approve(_exchange, uint256(-1)));
-        require(wBTC.approve(_exchange, uint256(-1)));
+        percentageFeeRewardsBps = _feeConfig[1];
+        percentageFeeGovernanceBps = _feeConfig[2];
     }
 
     function recoverStuck(
@@ -125,54 +118,24 @@ contract BadgerRenAdapter is OwnableUpgradeable {
 
         bytes32 pHash = keccak256(encoded);
         uint256 _mintAmount = registry.getGatewayBySymbol("BTC").mint(pHash, _amount, _nHash, _sig);
-        uint256 _fee = _processFee(renBTC, _mintAmount, mintFeeBps);
 
-        emit RecoverStuckRenBTC(_mintAmount, _fee);
+        emit RecoverStuck(_mintAmount);
 
-        renBTC.safeTransfer(msg.sender, _mintAmount.sub(_fee));
+        renBTC.safeTransfer(msg.sender, _mintAmount);
     }
 
-    function mintRenBTC(
-        // user args
-        address payable _destination,
+    // _mintWBTC mints wBTC which can be used by the parent contract to convert to lp tokens and deposit into sett.
+    function _mintWBTC(
+        // payload hash of all args user/darknode supplied (in case child contracts want to supply additional args)
+        bytes32 pHash,
+        address _destination,
+        uint256 _slippage,
         // darknode args
         uint256 _amount,
         bytes32 _nHash,
         bytes calldata _sig
-    ) external {
+    ) internal returns (uint256) {
         // Mint renBTC tokens
-        bytes32 pHash = keccak256(abi.encode(_destination));
-        uint256 _mintAmount = registry.getGatewayBySymbol("BTC").mint(pHash, _amount, _nHash, _sig);
-        uint256 _fee = _processFee(renBTC, _mintAmount, mintFeeBps);
-
-        emit MintRenBTC(_mintAmount, _fee);
-
-        renBTC.safeTransfer(_destination, _mintAmount.sub(_fee));
-    }
-
-    function burnRenBTC(bytes calldata _btcDestination, uint256 _amount) external {
-        require(renBTC.balanceOf(address(msg.sender)) >= _amount);
-        uint256 _startBalance = renBTC.balanceOf(address(this));
-        renBTC.safeTransferFrom(msg.sender, address(this), _amount);
-        uint256 _endBalance = renBTC.balanceOf(address(this));
-
-        uint256 _burnAmount = _endBalance.sub(_startBalance);
-        uint256 _fee = _processFee(renBTC, _burnAmount, burnFeeBps);
-
-        emit BurnRenBTC(_burnAmount, _fee);
-
-        uint256 burnAmount = registry.getGatewayBySymbol("BTC").burn(_btcDestination, _burnAmount.sub(_fee));
-    }
-
-    function mintWBTC(
-        uint256 _slippage,
-        address payable _destination,
-        uint256 _amount,
-        bytes32 _nHash,
-        bytes calldata _sig
-    ) external {
-        // Mint renBTC tokens
-        bytes32 pHash = keccak256(abi.encode(_slippage, _destination));
         uint256 _mintAmount = registry.getGatewayBySymbol("BTC").mint(pHash, _amount, _nHash, _sig);
 
         // Get price
@@ -196,24 +159,6 @@ contract BadgerRenAdapter is OwnableUpgradeable {
             emit ExchangeWBTCBytesError(_error);
             _fallbackTransferRenBTC(_destination, _mintAmount);
         }
-    }
-
-    function burnWBTC(
-        bytes calldata _btcDestination,
-        uint256 _amount,
-        uint256 _minAmount
-    ) external {
-        wBTC.safeTransferFrom(msg.sender, address(this), _amount);
-        uint256 _startBalance = renBTC.balanceOf(address(this));
-        exchange.exchange(1, 0, _amount, _minAmount);
-        uint256 _endBalance = renBTC.balanceOf(address(this));
-
-        uint256 _burnAmount = _endBalance.sub(_startBalance);
-        uint256 _fee = _processFee(renBTC, _burnAmount, burnFeeBps);
-
-        // Burn and send proceeds to the User
-        uint256 burnAmount = registry.getGatewayBySymbol("BTC").burn(_btcDestination, _burnAmount.sub(_fee));
-        emit BurnWBTC(_amount, burnAmount, _fee);
     }
 
     // _fallbackTransferRenBTC transfers minted renBTC to user when an exchange fails.
@@ -243,11 +188,6 @@ contract BadgerRenAdapter is OwnableUpgradeable {
     function setMintFeeBps(uint256 _mintFeeBps) external onlyOwner {
         require(_mintFeeBps <= MAX_BPS, "badger-ren-adapter/excessive-mint-fee");
         mintFeeBps = _mintFeeBps;
-    }
-
-    function setBurnFeeBps(uint256 _burnFeeBps) external onlyOwner {
-        require(_burnFeeBps <= MAX_BPS, "badger-ren-adapter/excessive-burn-fee");
-        burnFeeBps = _burnFeeBps;
     }
 
     function setPercentageFeeGovernanceBps(uint256 _percentageFeeGovernanceBps) external onlyOwner {
